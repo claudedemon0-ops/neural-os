@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#050b10">
-<title>NEURAL OS // v0.1</title>
+<title>NEURAL OS // v0.3</title>
 <style>
 :root{--cyan:#00f0ff;--green:#7dffb2;--amber:#ffcf5a;--bg:#050b10}
 *{box-sizing:border-box}
@@ -88,6 +88,11 @@ let voiceOn = false;
 let lastInference = 0;
 let lastSpoken = "";
 let lastSpokenAt = 0;
+let lastAnnouncedSet = "";
+let labelHistory = [];
+let speechQueue = [];
+let speechBusy = false;
+let lastQueueTime = 0;
 let animationId = null;
 
 function setMessage(text) { message.textContent = text; }
@@ -98,17 +103,31 @@ function resizeCanvas() {
 }
 function speak(text) {
   if (!voiceOn || !("speechSynthesis" in window)) return;
+  if (speechQueue.length < 2) speechQueue.push(text);
+  runSpeechQueue();
+}
+function runSpeechQueue() {
+  if (!voiceOn || speechBusy || !speechQueue.length || !("speechSynthesis" in window)) return;
   const now = Date.now();
-  if (text === lastSpoken && now - lastSpokenAt < 7000) return;
-  lastSpoken = text; lastSpokenAt = now;
-  window.speechSynthesis.cancel();
+  if (now - lastQueueTime < 5000) {
+    setTimeout(runSpeechQueue, 1000);
+    return;
+  }
+  speechBusy = true;
+  const text = speechQueue.shift();
   const utterance = new SpeechSynthesisUtterance(text);
-  utterance.rate = 1.0;
+  utterance.rate = 0.88;
+  utterance.volume = 1;
+  utterance.onend = utterance.onerror = () => {
+    speechBusy = false;
+    lastQueueTime = Date.now();
+    setTimeout(runSpeechQueue, 300);
+  };
   window.speechSynthesis.speak(utterance);
 }
 function drawDetections(result) {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  const items = result.detections || [];
+  const items = (result.detections || []).filter(d => (d.categories?.[0]?.score ?? 0) >= 0.65);
   const labels = [];
   for (const detection of items) {
     const box = detection.boundingBox;
@@ -133,9 +152,21 @@ function drawDetections(result) {
     ctx.fillText(label, box.originX + 5, labelY + 15);
   }
   const unique = [...new Set(labels)];
-  detectionsText.textContent = unique.length ? unique.join("  //  ") : "No objects above confidence threshold.";
+  // Require a label to appear in at least 3 of the last 5 inference passes.
+  labelHistory.push(unique);
+  if (labelHistory.length > 5) labelHistory.shift();
+  const counts = {};
+  for (const frameLabels of labelHistory) for (const label of frameLabels) counts[label] = (counts[label] || 0) + 1;
+  const stable = Object.keys(counts).filter(label => counts[label] >= 3);
+  detectionsText.textContent = stable.length ? stable.join("  //  ") : "Stabilizing detections…";
   overlay.innerHTML = `VISUAL FEED: ACTIVE<br>OBJECT TRACKING: ${items.length} TARGET(S)`;
-  if (unique.length) speak(`I can see ${unique.slice(0, 3).join(", ")}`);
+  hudbottom.textContent = `TARGETS: ${items.length}`;
+  const announcement = stable.slice(0, 3).join(", ");
+  if (announcement && announcement !== lastAnnouncedSet) {
+    speak(`I can see ${announcement}`);
+    lastAnnouncedSet = announcement;
+  }
+  if (!announcement) lastAnnouncedSet = "";
 }
 function loop(now) {
   if (!running) return;
@@ -160,11 +191,11 @@ async function start() {
     const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm");
     detector = await ObjectDetector.createFromOptions(vision, {
       baseOptions: {
-        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite",
+        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite2/float16/1/efficientdet_lite2.tflite",
         delegate: "GPU"
       },
       runningMode: "VIDEO",
-      scoreThreshold: 0.5,
+      scoreThreshold: 0.65,
       maxResults: 5
     });
     setMessage("Vision engine ready. Requesting rear camera…");
@@ -213,6 +244,10 @@ function stop() {
   voiceOn = false;
   voiceBtn.textContent = "VOICE: OFF";
   if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+  speechQueue = [];
+  speechBusy = false;
+  labelHistory = [];
+  lastAnnouncedSet = "";
 }
 startBtn.addEventListener("click", start);
 stopBtn.addEventListener("click", stop);
